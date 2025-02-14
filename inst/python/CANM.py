@@ -7,10 +7,25 @@ import numpy as np
 import random
 
 
-
-def fit(traindata, testdata=None, N=1, beta=1, batch_size=128, epochs=50, logpx=None, cuda=False, seed=0,
-        log_interval=10, learning_rate=1e-2, prior_sdy=0.5, update_sdy=True,preload=False, warming_up=False, verbose=False,
-        debug=False):
+def fit(
+    traindata,
+    testdata=None,
+    N=1,
+    beta=1,
+    batch_size=128,
+    epochs=50,
+    logpx=None,
+    cuda=True,
+    seed=0,
+    log_interval=10,
+    learning_rate=1e-2,
+    prior_sdy=0.5,
+    update_sdy=True,
+    preload=False,
+    debug=False,
+    training_hyperparameters=None,
+    verbose=False,
+):
     """
 
     :param traindata: Traning data of causal pair X, Y.
@@ -34,51 +49,80 @@ def fit(traindata, testdata=None, N=1, beta=1, batch_size=128, epochs=50, logpx=
 
     """
     torch.set_num_threads(1)
-    cuda = cuda and torch.cuda.is_available()
-    device = torch.device("cuda" if cuda else "cpu")
+    try:
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+            kwargs = {"num_workers": 0, "pin_memory": False}  # Force single-process loading for MPS
+        elif cuda and torch.cuda.is_available():
+            device = torch.device("cuda")
+            kwargs = {"num_workers": 0, "pin_memory": False}
+        else:
+            device = torch.device("cpu")
+            kwargs = {"num_workers": 1, "pin_memory": False}
+        
+        if verbose:
+            print(f"Using device: {device}")
+    except Exception as e:
+        print(f"Error initializing device, falling back to CPU. Error: {str(e)}")
+        device = torch.device("cpu")
+        kwargs = {"num_workers": 1, "pin_memory": False}
 
     model = CANM(N).to(device)
 
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    torch.cuda.manual_seed(seed)
 
-    # kwargs={}
-    kwargs = {'num_workers': 1, 'pin_memory': False}
     if logpx is None:
-        pde = gaussian_kde(traindata[0,:])
-        logpx=np.log(pde(traindata[0,:])).mean()
+        pde = gaussian_kde(traindata[:, 0])
+        logpx = pde.logpdf(traindata[:, 0]).mean()
     if preload:
         train_loader = traindata
         test_loader = testdata
 
     if not preload:
-        traindata = torch.from_numpy(traindata).float()
-        train_loader = torch.utils.data.DataLoader(traindata, batch_size=batch_size, shuffle=True, **kwargs)
+        traindata = torch.from_numpy(np.copy(traindata)).float().to(device)
+        train_loader = torch.utils.data.DataLoader(
+            traindata, batch_size=batch_size, shuffle=True, **kwargs
+        )
     if testdata is not None and not preload:
-        testdata = torch.from_numpy(testdata).float()
-        test_loader = torch.utils.data.DataLoader(testdata, batch_size=batch_size, shuffle=True, **kwargs)
+        testdata = torch.from_numpy(np.copy(testdata)).float().to(device)
+        test_loader = torch.utils.data.DataLoader(
+            testdata, batch_size=batch_size, shuffle=True, **kwargs
+        )
 
     if update_sdy:
-        sdy = torch.tensor([prior_sdy], device=device, dtype=torch.float, requires_grad=True)
-        optimizer = optim.Adam([{'params': model.parameters()}, {'params': sdy}],
-                               lr=learning_rate)  # Use Adam
+        sdy = torch.tensor(
+            [prior_sdy], device=device, dtype=torch.float, requires_grad=True
+        )
+        optimizer = optim.Adam(
+            [{"params": model.parameters()}, {"params": sdy}], lr=learning_rate
+        )  # Use Adam
     else:
-        sdy = torch.tensor([prior_sdy], device=device, dtype=torch.float, requires_grad=False)
-        optimizer = optim.Adam([{'params': model.parameters()}], lr=learning_rate)
+        sdy = torch.tensor(
+            [prior_sdy], device=device, dtype=torch.float, requires_grad=False
+        )
+        optimizer = optim.Adam([{"params": model.parameters()}], lr=learning_rate)
 
-
-    score = []
-    score_test = []
+    train_scores = []
+    test_scores = []
     for epoch in range(1, epochs + 1):
         # train(epoch)
         model.train()
         train_loss = 0
-        if warming_up:
-            wu_beta = beta / epoch
-        else:
+        if training_hyperparameters["type"] == "linear":
+            wu_beta = beta * (epoch / epochs) 
+        elif training_hyperparameters["type"] == "cyclical":
+            tau = ((epoch-1) % (epochs / training_hyperparameters["M"])) / (epochs / training_hyperparameters["M"])
+            if tau <= training_hyperparameters["R"]:
+                wu_beta = tau / training_hyperparameters["R"]
+            else:
+                wu_beta = beta
+        elif training_hyperparameters["type"] == "constant":
             wu_beta = beta
+        else:
+            raise ValueError(f"Unsupported training hyperparameter type: {training_hyperparameters['type']}")
+
         for batch_idx, data in enumerate(train_loader):
 
             data = data.to(device)
@@ -92,20 +136,26 @@ def fit(traindata, testdata=None, N=1, beta=1, batch_size=128, epochs=50, logpx=
 
             train_loss += loss.item()
             optimizer.step()
-            if update_sdy and sdy < 0.01: # Ensuring the sdy larger than 0.01 to avoid the NAN loss.
+            if (
+                update_sdy and sdy < 0.01
+            ):  # Ensuring the sdy larger than 0.01 to avoid the NAN loss.
                 sdy = sdy + 0.01
             if verbose and batch_idx % log_interval == 0:
-                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                    epoch, batch_idx * len(data), len(train_loader.dataset),
-                           100. * batch_idx / len(train_loader),
-                           loss.item() / len(data)))
+                print(
+                    "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
+                        epoch,
+                        batch_idx * len(data),
+                        len(train_loader.dataset),
+                        100.0 * batch_idx / len(train_loader),
+                        loss.item() / len(data),
+                    )
+                )
 
         train_loss /= len(train_loader.dataset)
 
-        score.append(-train_loss)
+        train_scores.append(-train_loss)
         if verbose:
-            print('====> Epoch: {} Average loss: {:.4f}'.format(
-                epoch, train_loss))
+            print("====> Epoch: {} Average loss: {:.4f}".format(epoch, train_loss))
 
         # test(epoch)
         if testdata is not None:
@@ -117,21 +167,33 @@ def fit(traindata, testdata=None, N=1, beta=1, batch_size=128, epochs=50, logpx=
                     yhat, mu, logvar = model(data)
                     # x = data[:, 0]
                     y = data[:, 1].view(-1, 1)
-                    test_loss += loss_function(y, yhat, mu, logvar, sdy, wu_beta).item() - logpx * len(data)
+                    test_loss += loss_function(
+                        y, yhat, mu, logvar, sdy, wu_beta
+                    ).item() - logpx * len(data)
 
                 test_loss /= len(test_loader.dataset)
-
-                score_test.append(-test_loss)
                 if verbose:
-                    print('====> Test set loss: {:.4f}'.format(test_loss))
+                    print("====> Test set loss: {:.4f}".format(test_loss))
+            test_scores.append(-test_loss)
 
     if testdata is not None:
-        output={'train_likelihood': -np.float(train_loss), 'test_likelihood': -np.float(test_loss),
-                'train_score': score, 'test_score': score_test, 'sdy': sdy.detach().numpy()}
+        output = {
+            "train_likelihood": -float(train_loss),
+            "test_likelihood": -float(test_loss),
+            "train_score": train_scores,
+            "test_score": [float(score) for score in test_scores],
+            "sdy": sdy.cpu().detach().numpy(),
+        }
     else:
-        output={'train_likelihood': -np.float(train_loss), 'train_score': score, 'sdy': sdy.detach().numpy()}
+        output = {
+            "train_likelihood": -float(train_loss),
+            "train_score": train_scores,
+            "sdy": sdy.cpu().detach().numpy(),
+        }
     if debug:
-        output['model']=model
+        output["model"] = model
+
+    output["logpx"] = logpx
 
     return output
 
@@ -146,7 +208,9 @@ def loss_function(y, yhat, mu, logvar, sdy, beta):
         sdy = -sdy + 0.01
 
     n = torch.distributions.Normal(0, sdy)
-    BCE = - torch.sum(n.log_prob(N)) # Compute the log-likelihood of noise distribution.
+
+    # negate because we want to maximize the likelihood
+    BCE = -torch.sum(n.log_prob(N))  # Compute the log-likelihood of noise distribution.
 
     # BCE=F.mse_loss(torch.cat((xhat,yhat),1),D)
     # see Appendix B from VAE paper:
@@ -154,10 +218,10 @@ def loss_function(y, yhat, mu, logvar, sdy, beta):
     # https://arxiv.org/abs/1312.6114
     # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
 
+    # do not negate because we want to minimize the KLD
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) * beta
     # KLD=0
     return BCE + KLD
-
 
 
 class CANM(nn.Module):
@@ -166,7 +230,7 @@ class CANM(nn.Module):
         self.N = N
         # encoder 输入只有y
         self.fc1 = nn.Linear(2, 20)
-        # 均值网络
+        # 均值网络ohxb
         self.fc21 = nn.Linear(20, 12)
         self.fc22 = nn.Linear(12, 7)
         self.fc23 = nn.Linear(7, N)
@@ -229,16 +293,19 @@ class CANM(nn.Module):
         yhat = self.decode(x, z)
         return yhat, mu, logvar
 
+
+
+
 if __name__ == "__main__":
     np.random.seed(0)
-    X=np.random.normal(0,1,10000)
-    Z=np.power(X,3)+0.5*np.random.normal(0,1,10000)
-    Y=np.tanh(2*Z)+0.5*np.random.normal(0,1,10000)
-    traindata1=np.array([X, Y]).transpose()
-    result1=fit(traindata1,verbose=True)
-    traindata2=np.array([Y, X]).transpose()
-    result2=fit(traindata2,N=1,verbose=True)
-    if np.max(result1['train_score'])>np.max(result2['train_score']):
-        print('X->Y')
+    X = np.random.normal(0, 1, 10000)
+    Z = np.power(X, 3) + 0.5 * np.random.normal(0, 1, 10000)
+    Y = np.tanh(2 * Z) + 0.5 * np.random.normal(0, 1, 10000)
+    traindata1 = np.array([X, Y]).transpose()
+    result1 = fit(traindata1, verbose=True)
+    traindata2 = np.array([Y, X]).transpose()
+    result2 = fit(traindata2, N=1, verbose=True)
+    if np.max(result1["train_score"]) > np.max(result2["train_score"]):
+        print("X->Y")
     else:
-        print('Y->X')
+        print("Y->X")
